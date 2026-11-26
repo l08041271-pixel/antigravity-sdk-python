@@ -18,14 +18,37 @@ import argparse
 import asyncio
 from collections.abc import AsyncIterator
 import contextlib
+import os
 import socket
 import sys
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 from mcp.server.fastmcp import server
+import pendo_sdk
+from pendo_sdk.mcp import PendoMCPServer
 import uvicorn
 
 Transport = Literal["stdio", "sse", "streamable-http"]
+
+
+def _pendo_visitor_id(request: Any) -> str | None:
+  """Returns the Pendo visitor id for a tool call."""
+  # TODO: Map this to the real visitor identity for your deployment.
+  # On HTTP transports, request is the Starlette request. On stdio there is no
+  # request, so whoever launches the server sets PENDO_VISITOR_ID.
+  if request is not None:
+    return request.headers.get("X-User-Id")
+  return os.environ.get("PENDO_VISITOR_ID") or None
+
+
+def _pendo_account_id(request: Any) -> str | None:
+  """Returns the Pendo account id for a tool call."""
+  # TODO: Map this to the real account identity for your deployment.
+  # On HTTP transports, request is the Starlette request. On stdio there is no
+  # request, so whoever launches the server sets PENDO_ACCOUNT_ID.
+  if request is not None:
+    return request.headers.get("X-Account-Id")
+  return os.environ.get("PENDO_ACCOUNT_ID") or None
 
 
 def _create_server(port: int) -> server.FastMCP:
@@ -67,6 +90,17 @@ def _create_server(port: int) -> server.FastMCP:
 **Result:** `{result}`
 
 *Pirates triple the first, double the second, add the meaning of life!*"""
+
+  # Records every tools/call as a Pendo Agent Analytics event, on every
+  # transport. The wrapper does not need to be kept: mcp is still the server.
+  PendoMCPServer(
+      server=mcp,
+      api_key="133ac9a8-3345-4bb9-857c-7151736024f4",
+      agent_id="eD2fjaTRpIL5tHU1UiH3jo2BCrM",
+      endpoint="https://app.pendo.io",
+      visitor_id=_pendo_visitor_id,
+      account_id=_pendo_account_id,
+  )
 
   return mcp
 
@@ -120,7 +154,12 @@ async def run(transport: str, port: int = 0) -> AsyncIterator[int]:
     yield bound_port
   finally:
     uvicorn_server.should_exit = True
-    await task
+    try:
+      await task
+    finally:
+      # Sends what a tool call still in flight recorded. flush() blocks, so
+      # keep it off the event loop.
+      await asyncio.to_thread(pendo_sdk.flush)
 
 
 def main(argv: Sequence[str]) -> None:
@@ -137,7 +176,12 @@ def main(argv: Sequence[str]) -> None:
   args = parser.parse_args(argv[1:])
 
   mcp = _create_server(args.port)
-  mcp.run(transport=args.transport)
+  try:
+    mcp.run(transport=args.transport)
+  finally:
+    # Sends what a tool call still in flight recorded, including when the
+    # server is stopped with Ctrl-C.
+    pendo_sdk.flush()
 
 
 if __name__ == "__main__":
